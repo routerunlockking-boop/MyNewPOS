@@ -1,0 +1,1588 @@
+const API = '/api';
+let token = localStorage.getItem('pos_token') || null;
+let bizName = localStorage.getItem('pos_business') || '';
+let role = localStorage.getItem('pos_role') || 'user';
+let products = [], customers = [], currentBill = [], imeiInBill = [];
+let hasImeiInBill = false;
+let scanModeActive = false;
+let voucherDiscount = 0;
+let voucherCode = '';
+let previousPendingCount = 0;
+
+// === UTILITY ===
+function toast(msg, type='success') {
+    const c = document.getElementById('toast-container');
+    const t = document.createElement('div');
+    t.style.cssText = `padding:12px 18px;border-radius:10px;color:#fff;font-weight:500;font-size:13px;
+        box-shadow:var(--shadow-lg);opacity:0;transform:translateY(-20px);
+        transition:all 0.4s ease;display:flex;align-items:center;gap:8px;max-width:360px;
+        background:${type==='success'?'linear-gradient(135deg,var(--success),var(--primary-hover))':type==='scan'?'linear-gradient(135deg,var(--info),#2563eb)':'linear-gradient(135deg,var(--danger),#dc2626)'}`;
+    const icon = type==='success'?'bx-check-circle':type==='scan'?'bx-barcode':'bx-error-circle';
+    t.innerHTML = `<i class='bx ${icon}'></i>${msg}`;
+    c.appendChild(t);
+    requestAnimationFrame(() => { t.style.opacity='1'; t.style.transform='translateY(0)'; });
+    setTimeout(() => { t.style.opacity='0'; setTimeout(() => t.remove(), 400); }, 3500);
+}
+
+async function api(url, opts={}) {
+    const h = opts.headers || {};
+    if (token) h['Authorization'] = `Bearer ${token}`;
+    h['Content-Type'] = h['Content-Type'] || 'application/json';
+    opts.headers = h;
+    const res = await fetch(API + url, opts);
+    if (res.status === 401) { logout(); return null; }
+    return res;
+}
+
+function openModal(id) { document.getElementById(id).classList.add('active'); }
+function closeModal(id) { document.getElementById(id).classList.remove('active'); }
+
+function formatDate(d) {
+    if (!d) return '-';
+    return new Intl.DateTimeFormat('en-CA', { timeZone:'Asia/Colombo' }).format(new Date(d));
+}
+
+function statusBadge(s) {
+    const m = {'In Stock':'green','Sold':'blue','Returned':'yellow','Under Repair':'yellow',
+        'Sent to SLT':'yellow','Received from SLT':'blue','Delivered to Customer':'green',
+        'Replaced':'gray','Rejected':'red','Cancelled':'red'};
+    return `<span class="badge badge-${m[s]||'gray'}">${s}</span>`;
+}
+
+// Sanitize barcode scanner input
+function sanitizeBarcode(raw) {
+    return raw.replace(/[\r\n\t]/g, '').replace(/^[^0-9]*/,'').replace(/[^0-9]*$/,'').trim();
+}
+
+// === AUTH ===
+document.getElementById('login-form').addEventListener('submit', async e => {
+    e.preventDefault();
+    try {
+        const res = await fetch(API+'/auth/login', { method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({ email:document.getElementById('login-email').value, password:document.getElementById('login-password').value })
+        });
+        const d = await res.json();
+        if (!res.ok) throw new Error(d.error);
+        token=d.token; bizName=d.business_name; role=d.role;
+        localStorage.setItem('pos_token',token); localStorage.setItem('pos_business',bizName); localStorage.setItem('pos_role',role);
+        checkAuth();
+    } catch(e) { toast(e.message,'error'); }
+});
+
+document.getElementById('register-form').addEventListener('submit', async e => {
+    e.preventDefault();
+    try {
+        const res = await fetch(API+'/auth/register', { method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({ 
+                email: document.getElementById('reg-email').value, 
+                password: document.getElementById('reg-password').value, 
+                business_name: document.getElementById('reg-business').value,
+                whatsapp_number: document.getElementById('reg-whatsapp').value
+            })
+        });
+        const d = await res.json();
+        if (!res.ok) throw new Error(d.error);
+        toast(d.message); document.getElementById('switch-to-login').click();
+    } catch(e) { toast(e.message,'error'); }
+});
+
+document.getElementById('forgot-password-form').addEventListener('submit', async e => {
+    e.preventDefault();
+    try {
+        const res = await fetch(API+'/auth/reset-password', { method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({
+                email: document.getElementById('forgot-email').value,
+                business_name: document.getElementById('forgot-business').value,
+                new_password: document.getElementById('forgot-password').value
+            })
+        });
+        const d = await res.json();
+        if (!res.ok) throw new Error(d.error);
+        toast(d.message); document.getElementById('switch-to-login2').click();
+        document.getElementById('forgot-password-form').reset();
+    } catch(e) { toast(e.message, 'error'); }
+});
+
+document.getElementById('switch-to-register').onclick = () => { document.getElementById('login-form').classList.remove('active'); document.getElementById('forgot-password-form').classList.remove('active'); document.getElementById('register-form').classList.add('active'); };
+document.getElementById('switch-to-login').onclick = () => { document.getElementById('register-form').classList.remove('active'); document.getElementById('forgot-password-form').classList.remove('active'); document.getElementById('login-form').classList.add('active'); };
+document.getElementById('switch-to-forgot').onclick = (e) => { e.preventDefault(); document.getElementById('login-form').classList.remove('active'); document.getElementById('register-form').classList.remove('active'); document.getElementById('forgot-password-form').classList.add('active'); };
+document.getElementById('switch-to-login2').onclick = () => { document.getElementById('forgot-password-form').classList.remove('active'); document.getElementById('login-form').classList.add('active'); };
+
+function logout() { token=null; bizName=''; role='user'; localStorage.removeItem('pos_token'); localStorage.removeItem('pos_business'); localStorage.removeItem('pos_role'); checkAuth(); }
+document.getElementById('btn-logout').onclick = logout;
+
+// === PROFILE ===
+document.getElementById('btn-profile').onclick = async () => {
+    try {
+        const res = await fetch(API + '/auth/profile', {
+            headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' }
+        });
+        if (!res.ok) { toast('Failed to load profile', 'error'); return; }
+        const p = await res.json();
+        document.getElementById('profile-business').value = p.business_name || '';
+        document.getElementById('profile-email').value = p.email || '';
+        document.getElementById('profile-phone').value = p.whatsapp_number || '';
+        document.getElementById('profile-role').value = p.role || 'user';
+        document.getElementById('profile-password').value = '';
+        openModal('modal-profile');
+    } catch(e) { toast(e.message, 'error'); }
+};
+
+document.getElementById('btn-save-profile').onclick = async () => {
+    const data = {
+        business_name: document.getElementById('profile-business').value,
+        email: document.getElementById('profile-email').value,
+        whatsapp_number: document.getElementById('profile-phone').value
+    };
+    const pw = document.getElementById('profile-password').value;
+    if (pw.trim()) data.password = pw;
+    if (!data.business_name || !data.email) return toast('Business name and email required', 'error');
+    try {
+        const res = await fetch(API + '/auth/profile', {
+            method: 'PUT',
+            headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify(data)
+        });
+        const d = await res.json();
+        if (!res.ok) throw new Error(d.error);
+        bizName = d.business_name;
+        localStorage.setItem('pos_business', bizName);
+        document.getElementById('biz-name').textContent = bizName;
+        toast('Profile updated');
+        closeModal('modal-profile');
+    } catch(e) { toast(e.message, 'error'); }
+};
+
+// === INVOICE SETTINGS ===
+window.openInvoiceSettingsModal = async function() {
+    try {
+        const res = await fetch(API + '/auth/profile', {
+            headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' }
+        });
+        if (!res.ok) { toast('Failed to load profile settings', 'error'); return; }
+        const p = await res.json();
+        const inv = p.invoice_settings || {};
+        document.getElementById('inv-set-title').value = inv.header_title || 'SMARTZONE';
+        document.getElementById('inv-set-subtitle').value = inv.header_subtitle || 'New Town Padaviya, Anuradhapura';
+        document.getElementById('inv-set-contact').value = inv.header_contact || 'Mobile: 078-68000 86';
+        
+        document.getElementById('inv-set-tax').value = inv.tax_invoice_text || 'Tax Invoice';
+        document.getElementById('inv-set-billno').value = inv.label_bill_no || 'Bill No:';
+        document.getElementById('inv-set-cashier').value = inv.label_cashier || 'Cashier:';
+        document.getElementById('inv-set-customer').value = inv.label_customer || 'Customer:';
+        document.getElementById('inv-set-tel').value = inv.label_tel || 'Tel:';
+        
+        document.getElementById('inv-set-item').value = inv.label_item || 'Item';
+        document.getElementById('inv-set-qty').value = inv.label_qty || 'Qty';
+        document.getElementById('inv-set-amt').value = inv.label_amt || 'Amount'; // Assuming amt was used, wait schema says label_amount
+        document.getElementById('inv-set-subtotal').value = inv.label_subtotal || 'Subtotal';
+        document.getElementById('inv-set-total').value = inv.label_total || 'TOTAL';
+        document.getElementById('inv-set-paid').value = inv.label_amount_paid || 'Amount Paid';
+        document.getElementById('inv-set-bal').value = inv.label_balance || 'Balance';
+        
+        document.getElementById('inv-set-msg1').value = inv.footer_message1 || 'Thank You! Come Again';
+        document.getElementById('inv-set-msg2').value = inv.footer_message2 || 'Please keep this receipt for warranty claims.<br>Items with IMEI are subject to warranty conditions.';
+        document.getElementById('inv-set-powered').value = inv.footer_powered_by || 'Powered by SmartZone';
+        
+        closeModal('modal-profile');
+        openModal('modal-invoice-settings');
+    } catch(e) { toast(e.message, 'error'); }
+};
+
+document.getElementById('btn-save-invoice-settings').onclick = async () => {
+    const data = {
+        invoice_settings: {
+            header_title: document.getElementById('inv-set-title').value,
+            header_subtitle: document.getElementById('inv-set-subtitle').value,
+            header_contact: document.getElementById('inv-set-contact').value,
+            tax_invoice_text: document.getElementById('inv-set-tax').value,
+            label_bill_no: document.getElementById('inv-set-billno').value,
+            label_cashier: document.getElementById('inv-set-cashier').value,
+            label_customer: document.getElementById('inv-set-customer').value,
+            label_tel: document.getElementById('inv-set-tel').value,
+            label_item: document.getElementById('inv-set-item').value,
+            label_qty: document.getElementById('inv-set-qty').value,
+            label_amount: document.getElementById('inv-set-amt').value,
+            label_subtotal: document.getElementById('inv-set-subtotal').value,
+            label_total: document.getElementById('inv-set-total').value,
+            label_amount_paid: document.getElementById('inv-set-paid').value,
+            label_balance: document.getElementById('inv-set-bal').value,
+            footer_message1: document.getElementById('inv-set-msg1').value,
+            footer_message2: document.getElementById('inv-set-msg2').value,
+            footer_powered_by: document.getElementById('inv-set-powered').value
+        }
+    };
+    try {
+        const res = await fetch(API + '/auth/profile', {
+            method: 'PUT',
+            headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify(data)
+        });
+        if (!res.ok) throw new Error('Failed to update invoice settings');
+        toast('Invoice settings saved successfully');
+        closeModal('modal-invoice-settings');
+    } catch(e) { toast(e.message, 'error'); }
+};
+
+function checkAuth() {
+    if (token) {
+        document.getElementById('auth-overlay').classList.remove('active');
+        document.getElementById('biz-name').textContent = bizName;
+        if (role === 'admin') { 
+            document.getElementById('nav-admin-item').style.display='block'; 
+            document.getElementById('nav-admin-divider').style.display='block'; 
+        } else {
+            document.getElementById('nav-admin-item').style.display='none'; 
+            document.getElementById('nav-admin-divider').style.display='none'; 
+        }
+        loadDashboard();
+    } else { document.getElementById('auth-overlay').classList.add('active'); }
+}
+
+// === THEME ===
+function initTheme() {
+    const saved = localStorage.getItem('pos_theme') || 'light';
+    if (saved==='dark') { document.body.classList.add('dark-mode'); document.querySelector('#btn-theme i').classList.replace('bx-moon','bx-sun'); }
+    document.getElementById('btn-theme').onclick = () => {
+        const dark = document.body.classList.toggle('dark-mode');
+        localStorage.setItem('pos_theme', dark?'dark':'light');
+        document.querySelector('#btn-theme i').classList.replace(dark?'bx-moon':'bx-sun', dark?'bx-sun':'bx-moon');
+    };
+}
+
+// === CLOCK ===
+function updateClock() { document.getElementById('clock').textContent = new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})+' · '+new Date().toLocaleDateString(); }
+
+// === NAVIGATION ===
+let currentView = 'dashboard-view';
+function setupNav() {
+    document.querySelectorAll('.nav-link').forEach(link => {
+        link.onclick = e => {
+            e.preventDefault();
+            document.querySelectorAll('.nav-link').forEach(l=>l.classList.remove('active'));
+            link.classList.add('active');
+            const target = link.dataset.target;
+            document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
+            document.getElementById(target).classList.add('active');
+            document.getElementById('page-title').textContent = link.dataset.title;
+            currentView = target;
+            if(target==='dashboard-view') loadDashboard();
+            if(target==='inventory-view') loadInventory();
+            if(target==='pos-view') { loadPOS(); focusScanField(); }
+            if(target==='imei-view') loadImeiList();
+            if(target==='customers-view') loadCustomers();
+            if(target==='suppliers-view') loadSuppliers();
+            if(target==='invoices-view') loadInvoices();
+            if(target==='design-view') loadInvoiceDesigner();
+            if(target==='reports-view') loadReports('sales');
+            if(target==='vouchers-view') loadVouchers();
+            if(target==='admin-view') { loadAdmin(); document.getElementById('admin-notify-dot').style.display='none'; previousPendingCount=0; }
+            if(target==='barcode-view') loadBarcodePrinter();
+            if(target==='slt-view') { /* ready for generate */ }
+        };
+    });
+}
+
+// === SCAN MODE ===
+function toggleScanMode() {
+    scanModeActive = !scanModeActive;
+    const bar = document.getElementById('scan-mode-bar');
+    const btn = document.getElementById('btn-scan-mode');
+    if (scanModeActive) {
+        bar.classList.add('active');
+        btn.innerHTML = '<i class="bx bx-stop"></i> Stop';
+        btn.classList.add('btn-danger');
+        btn.classList.remove('btn-primary');
+        document.getElementById('pos-view').classList.add('scan-mode-active');
+        focusScanField();
+    } else {
+        bar.classList.remove('active');
+        btn.innerHTML = '<i class="bx bx-broadcast"></i> Scan';
+        btn.classList.remove('btn-danger');
+        btn.classList.add('btn-primary');
+        document.getElementById('pos-view').classList.remove('scan-mode-active');
+    }
+}
+
+function focusScanField() {
+    setTimeout(() => { const el = document.getElementById('pos-scan'); if(el) el.focus(); }, 100);
+}
+
+// === CAMERA BARCODE SCANNER ===
+let html5QrScanner = null;
+let cameraScanTarget = ''; // 'pos', 'warranty', 'imei-stock'
+
+function openCameraScanner(target) {
+    cameraScanTarget = target;
+    openModal('modal-camera-scanner');
+    document.getElementById('camera-scan-result').textContent = 'Starting camera...';
+    document.getElementById('camera-scan-result').style.color = 'var(--text-muted)';
+
+    setTimeout(() => {
+        if (html5QrScanner) {
+            try { html5QrScanner.clear(); } catch(e) {}
+        }
+        html5QrScanner = new Html5QrcodeScanner("camera-scanner-region", {
+            fps: 15,
+            qrbox: { width: 280, height: 120 },
+            rememberLastUsedCamera: true,
+            supportedScanTypes: [Html5QrcodeScanType.SCAN_TYPE_CAMERA],
+            formatsToSupport: [
+                Html5QrcodeSupportedFormats.CODE_128,
+                Html5QrcodeSupportedFormats.CODE_39,
+                Html5QrcodeSupportedFormats.EAN_13,
+                Html5QrcodeSupportedFormats.EAN_8,
+                Html5QrcodeSupportedFormats.UPC_A,
+                Html5QrcodeSupportedFormats.UPC_E,
+                Html5QrcodeSupportedFormats.ITF,
+                Html5QrcodeSupportedFormats.CODE_93,
+                Html5QrcodeSupportedFormats.CODABAR,
+                Html5QrcodeSupportedFormats.QR_CODE
+            ]
+        }, false);
+
+        html5QrScanner.render(onCameraScanSuccess, onCameraScanFailure);
+        document.getElementById('camera-scan-result').textContent = 'Point camera at barcode...';
+    }, 400);
+}
+
+function onCameraScanSuccess(decodedText) {
+    const barcode = sanitizeBarcode(decodedText);
+    if (!barcode) return;
+
+    // Show scanned result
+    const resultEl = document.getElementById('camera-scan-result');
+    resultEl.innerHTML = `<span style="color:var(--success);font-weight:700"><i class='bx bx-check-circle'></i> Scanned: ${barcode}</span>`;
+
+    // Route to the right target using direct function calls
+    if (cameraScanTarget === 'pos') {
+        handlePosScan(barcode);
+    } else if (cameraScanTarget === 'warranty') {
+        document.getElementById('warranty-scan').value = barcode;
+        document.getElementById('btn-warranty-lookup').click();
+    } else if (cameraScanTarget === 'imei-stock') {
+        handleImeiStockScan(barcode);
+    } else if (cameraScanTarget === 'imei-tracker') {
+        document.getElementById('imei-search').value = barcode;
+        loadImeiList();
+    }
+
+    toast(`Scanned: ${barcode}`, 'scan');
+
+    // Close after short delay so user sees the result
+    setTimeout(() => closeCameraScanner(), 800);
+}
+
+function onCameraScanFailure(error) {
+    // Ignore — continuous scanning errors are expected until a barcode is found
+}
+
+function closeCameraScanner() {
+    if (html5QrScanner) {
+        try { html5QrScanner.clear(); } catch(e) {}
+        html5QrScanner = null;
+    }
+    closeModal('modal-camera-scanner');
+    // Refocus the right field after closing
+    if (cameraScanTarget === 'pos') focusScanField();
+    else if (cameraScanTarget === 'imei-stock') {
+        setTimeout(() => document.getElementById('imei-scan-input')?.focus(), 200);
+    } else if (cameraScanTarget === 'imei-tracker') {
+        setTimeout(() => document.getElementById('imei-search')?.focus(), 200);
+    }
+}
+
+// === SUPPLIERS ===
+let suppliers = [];
+async function loadSuppliers() {
+    const search = document.getElementById('sup-search')?.value || '';
+    try {
+        const res = await api(`/suppliers?search=${encodeURIComponent(search)}&_t=${Date.now()}`);
+        if (!res) return;
+        suppliers = await res.json();
+        
+        // Populate supplier table
+        const tb = document.querySelector('#sup-table tbody');
+        if (tb) {
+            tb.innerHTML = suppliers.map(c => `<tr>
+                <td><strong>${c.name}</strong></td><td>${c.phone}</td>
+                <td>${c.nic_number||'-'}</td><td>${c.email||'-'}</td><td>${c.address||'-'}</td>
+                <td><button class="btn btn-sm btn-outline" onclick="editSupplier('${c.id}')"><i class='bx bx-edit'></i></button>
+                    <button class="btn btn-sm btn-danger" onclick="deleteSupplier('${c.id}')"><i class='bx bx-trash'></i></button></td>
+            </tr>`).join('');
+        }
+
+        // Populate product modal supplier dropdown
+        const prodSup = document.getElementById('prod-supplier');
+        if (prodSup) {
+            const currentVal = prodSup.value;
+            prodSup.innerHTML = '<option value="">-- No Supplier --</option>' +
+                suppliers.map(c => `<option value="${c.name}">${c.name}</option>`).join('');
+            if (currentVal && suppliers.some(s => s.name === currentVal)) prodSup.value = currentVal;
+        }
+
+        // Populate supplier payment filter dropdown
+        const supPayFilter = document.getElementById('sup-payment-supplier-filter');
+        if (supPayFilter) {
+            supPayFilter.innerHTML = '<option value="">All Suppliers</option>' +
+                suppliers.map(c => `<option value="${c.name}">${c.name}</option>`).join('');
+        }
+
+        // Load supplier payments
+        loadSupplierPayments();
+    } catch(e) { console.error(e); }
+}
+
+function setupSupplierModal() {
+    document.getElementById('btn-add-supplier').onclick = () => {
+        document.getElementById('supplier-form').reset();
+        document.getElementById('sup-id').value = '';
+        document.getElementById('supplier-modal-title').textContent = 'Add Supplier';
+        openModal('modal-supplier');
+    };
+    document.getElementById('sup-search').onkeyup = loadSuppliers;
+    
+    document.getElementById('btn-save-supplier').onclick = async () => {
+        const id = document.getElementById('sup-id').value;
+        const data = {
+            name: document.getElementById('sup-name').value,
+            phone: document.getElementById('sup-phone').value,
+            nic_number: document.getElementById('sup-nic').value,
+            email: document.getElementById('sup-email').value,
+            address: document.getElementById('sup-addr').value
+        };
+        if (!data.name || !data.phone) return toast('Name and phone required', 'error');
+        try {
+            const res = await api(id ? `/suppliers/${id}` : '/suppliers', { method: id?'PUT':'POST', body: JSON.stringify(data) });
+            if (!res) return;
+            const d = await res.json();
+            if (!res.ok) throw new Error(d.error);
+            toast(id ? 'Supplier updated' : 'Supplier added');
+            closeModal('modal-supplier'); loadSuppliers();
+        } catch(e) { toast(e.message, 'error'); }
+    };
+
+    // Supplier payment filters
+    document.getElementById('sup-payment-filter').onchange = loadSupplierPayments;
+    document.getElementById('sup-payment-supplier-filter').onchange = loadSupplierPayments;
+
+    // Sync all inventory products with suppliers into payment records
+    document.getElementById('btn-sync-inventory')?.addEventListener('click', async () => {
+        const btn = document.getElementById('btn-sync-inventory');
+        btn.disabled = true;
+        btn.innerHTML = "<i class='bx bx-loader bx-spin'></i> Syncing...";
+        try {
+            const res = await api('/suppliers/sync-inventory', { method: 'POST' });
+            if (!res) return;
+            const d = await res.json();
+            if (!res.ok) throw new Error(d.error);
+            toast(d.message);
+            loadSupplierPayments();
+        } catch(e) { toast(e.message, 'error'); }
+        finally {
+            btn.disabled = false;
+            btn.innerHTML = "<i class='bx bx-refresh'></i> Sync Inventory";
+        }
+    });
+}
+
+async function editSupplier(id) {
+    const s = suppliers.find(x => x.id === id);
+    if (!s) return;
+    document.getElementById('sup-id').value = s.id;
+    document.getElementById('sup-name').value = s.name;
+    document.getElementById('sup-phone').value = s.phone;
+    document.getElementById('sup-nic').value = s.nic_number || '';
+    document.getElementById('sup-email').value = s.email || '';
+    document.getElementById('sup-addr').value = s.address || '';
+    document.getElementById('supplier-modal-title').textContent = 'Edit Supplier';
+    openModal('modal-supplier');
+}
+
+async function deleteSupplier(id) {
+    if (!confirm('Delete this supplier?')) return;
+    try {
+        const res = await api(`/suppliers/${id}`, { method:'DELETE' });
+        if (!res) return;
+        if (!res.ok) throw new Error('Failed to delete');
+        toast('Supplier deleted'); loadSuppliers();
+    } catch(e) { toast(e.message, 'error'); }
+}
+
+// === INVOICE DESIGNER ===
+let invoiceTemplates = [];
+const DEFAULT_ORDER = ['header', 'invoice_info', 'people_info', 'items', 'totals', 'footer'];
+const DEFAULT_VIS = { header:true, invoice_info:true, people_info:true, items:true, totals:true, footer:true };
+const DEFAULT_LABELS = {
+    header_title: 'SMARTZONE', header_subtitle: 'New Town Padaviya, Anuradhapura', header_contact: 'Mobile: 078-68000 86', tax_text: 'Tax Invoice',
+    label_bill: 'Bill No:', label_date: 'Date:',
+    label_cashier: 'Cashier:', label_customer: 'Customer:', label_tel: 'Tel:',
+    label_item: 'Item', label_qty: 'Qty', label_amount: 'Amount',
+    label_subtotal: 'Subtotal', label_total: 'TOTAL', label_paid: 'Amount Paid', label_balance: 'Balance',
+    footer_msg1: 'Thank You! Come Again', footer_msg2: 'Please keep this receipt for warranty claims.'
+};
+
+let currentOrder = [...DEFAULT_ORDER];
+let currentVis = {...DEFAULT_VIS};
+let currentLabels = {...DEFAULT_LABELS};
+
+function renderBuilderBlocks() {
+    const container = document.getElementById('builder-blocks');
+    container.innerHTML = '';
+    
+    const blockNames = {
+        header: 'Header (Store Info)',
+        invoice_info: 'Invoice Meta (Bill No & Date)',
+        people_info: 'People Info (Cashier & Customer)',
+        items: 'Items Table',
+        totals: 'Totals & Balance',
+        footer: 'Footer Messages'
+    };
+
+    currentOrder.forEach((blockId, index) => {
+        const isVis = currentVis[blockId] !== false;
+        
+        let settingsHtml = '';
+        if (blockId === 'header') {
+            settingsHtml = `
+                <div class="form-group"><label>Title</label><input type="text" class="form-control" onchange="updateLabel('header_title', this.value)" value="${currentLabels.header_title}"></div>
+                <div class="form-group"><label>Subtitle</label><input type="text" class="form-control" onchange="updateLabel('header_subtitle', this.value)" value="${currentLabels.header_subtitle}"></div>
+                <div class="form-group"><label>Contact</label><input type="text" class="form-control" onchange="updateLabel('header_contact', this.value)" value="${currentLabels.header_contact}"></div>
+                <div class="form-group"><label>Tax Text</label><input type="text" class="form-control" onchange="updateLabel('tax_text', this.value)" value="${currentLabels.tax_text}"></div>
+            `;
+        } else if (blockId === 'invoice_info') {
+            settingsHtml = `
+                <div class="form-group"><label>Bill No Label</label><input type="text" class="form-control" onchange="updateLabel('label_bill', this.value)" value="${currentLabels.label_bill}"></div>
+                <div class="form-group"><label>Date Label</label><input type="text" class="form-control" onchange="updateLabel('label_date', this.value)" value="${currentLabels.label_date}"></div>
+            `;
+        } else if (blockId === 'people_info') {
+            settingsHtml = `
+                <div class="form-group"><label>Cashier Label</label><input type="text" class="form-control" onchange="updateLabel('label_cashier', this.value)" value="${currentLabels.label_cashier}"></div>
+                <div class="form-group"><label>Customer Label</label><input type="text" class="form-control" onchange="updateLabel('label_customer', this.value)" value="${currentLabels.label_customer}"></div>
+                <div class="form-group"><label>Tel Label</label><input type="text" class="form-control" onchange="updateLabel('label_tel', this.value)" value="${currentLabels.label_tel}"></div>
+            `;
+        } else if (blockId === 'items') {
+            settingsHtml = `
+                <div style="display:flex;gap:5px;">
+                    <div class="form-group"><label>Item</label><input type="text" class="form-control" onchange="updateLabel('label_item', this.value)" value="${currentLabels.label_item}"></div>
+                    <div class="form-group"><label>Qty</label><input type="text" class="form-control" onchange="updateLabel('label_qty', this.value)" value="${currentLabels.label_qty}"></div>
+                    <div class="form-group"><label>Amount</label><input type="text" class="form-control" onchange="updateLabel('label_amount', this.value)" value="${currentLabels.label_amount}"></div>
+                </div>
+            `;
+        } else if (blockId === 'totals') {
+            settingsHtml = `
+                <div style="display:flex;gap:5px;">
+                    <div class="form-group"><label>Subtotal</label><input type="text" class="form-control" onchange="updateLabel('label_subtotal', this.value)" value="${currentLabels.label_subtotal}"></div>
+                    <div class="form-group"><label>TOTAL</label><input type="text" class="form-control" onchange="updateLabel('label_total', this.value)" value="${currentLabels.label_total}"></div>
+                </div>
+                <div style="display:flex;gap:5px;">
+                    <div class="form-group"><label>Paid</label><input type="text" class="form-control" onchange="updateLabel('label_paid', this.value)" value="${currentLabels.label_paid}"></div>
+                    <div class="form-group"><label>Balance</label><input type="text" class="form-control" onchange="updateLabel('label_balance', this.value)" value="${currentLabels.label_balance}"></div>
+                </div>
+            `;
+        } else if (blockId === 'footer') {
+            settingsHtml = `
+                <div class="form-group"><label>Message 1</label><input type="text" class="form-control" onchange="updateLabel('footer_msg1', this.value)" value="${currentLabels.footer_msg1}"></div>
+                <div class="form-group"><label>Message 2</label><input type="text" class="form-control" onchange="updateLabel('footer_msg2', this.value)" value="${currentLabels.footer_msg2}"></div>
+            `;
+        }
+
+        const blockEl = document.createElement('div');
+        blockEl.style.border = '1px solid var(--border)';
+        blockEl.style.borderRadius = '6px';
+        blockEl.style.overflow = 'hidden';
+        
+        blockEl.innerHTML = `
+            <div style="background:var(--secondary);padding:8px 10px;display:flex;align-items:center;justify-content:space-between;cursor:pointer;border-radius:6px 6px 0 0">
+                <div style="display:flex;align-items:center;gap:10px" onclick="toggleSettings('${blockId}')">
+                    <i class='bx bx-dots-vertical-rounded' style="color:var(--text-muted)"></i>
+                    <span style="font-weight:600;font-size:13px;color:${isVis?'var(--text-main)':'var(--text-muted)'}">${blockNames[blockId]}</span>
+                </div>
+                <div style="display:flex;align-items:center;gap:5px">
+                    <button class="btn btn-sm btn-outline" style="padding:2px 5px" onclick="moveBlock(${index}, -1)" ${index===0?'disabled':''}><i class='bx bx-up-arrow-alt'></i></button>
+                    <button class="btn btn-sm btn-outline" style="padding:2px 5px" onclick="moveBlock(${index}, 1)" ${index===currentOrder.length-1?'disabled':''}><i class='bx bx-down-arrow-alt'></i></button>
+                    <button class="btn btn-sm ${isVis?'btn-primary':'btn-outline'}" style="padding:2px 5px" onclick="toggleVis('${blockId}')"><i class='bx ${isVis?'bx-show':'bx-hide'}'></i></button>
+                </div>
+            </div>
+            <div id="settings-${blockId}" style="display:none;padding:10px;background:var(--bg-card);border-top:1px solid var(--border)">
+                ${settingsHtml}
+            </div>
+        `;
+        container.appendChild(blockEl);
+    });
+}
+
+window.toggleSettings = function(id) {
+    const el = document.getElementById(`settings-${id}`);
+    if (el) el.style.display = el.style.display === 'none' ? 'block' : 'none';
+};
+
+window.updateLabel = function(key, val) {
+    currentLabels[key] = val;
+    updateLivePreview();
+};
+
+window.moveBlock = function(idx, dir) {
+    if (idx + dir < 0 || idx + dir >= currentOrder.length) return;
+    const temp = currentOrder[idx];
+    currentOrder[idx] = currentOrder[idx + dir];
+    currentOrder[idx + dir] = temp;
+    renderBuilderBlocks();
+    updateLivePreview();
+};
+
+window.toggleVis = function(id) {
+    currentVis[id] = currentVis[id] === false ? true : false;
+    renderBuilderBlocks();
+    updateLivePreview();
+};
+
+function updateLivePreview() {
+    let previewHtml = '';
+    
+    currentOrder.forEach(blockId => {
+        if (currentVis[blockId] === false) return;
+        
+        if (blockId === 'header') {
+            previewHtml += `
+                <div style="text-align:center;margin-bottom:12px;">
+                    <h1 style="margin:0;font-size:24px;font-weight:800;text-transform:uppercase;">${currentLabels.header_title}</h1>
+                    <p style="margin:2px 0;font-size:11px;font-weight:500;">${currentLabels.header_subtitle}</p>
+                    <p style="margin:0;font-size:11px;font-weight:500;">${currentLabels.header_contact}</p>
+                    <div style="border-bottom:1.5px dashed var(--border);margin:8px 0;"></div>
+                    <h2 style="margin:0;font-size:14px;font-weight:700;text-transform:uppercase;">${currentLabels.tax_text}</h2>
+                </div>
+            `;
+        } else if (blockId === 'invoice_info') {
+            previewHtml += `
+                <div style="font-size:11px;font-weight:500;display:flex;justify-content:space-between;margin-bottom:4px;">
+                    <span>${currentLabels.label_bill} INV-1001</span>
+                    <span>${currentLabels.label_date} 2026-05-01</span>
+                </div>
+            `;
+        } else if (blockId === 'people_info') {
+            previewHtml += `
+                <div style="font-size:11px;font-weight:500;margin-bottom:8px;">
+                    <div style="margin-bottom:4px;">${currentLabels.label_cashier} <strong>Smart Zone</strong></div>
+                    <div style="margin-top:6px;">
+                        <div style="font-weight:700;">${currentLabels.label_customer} Pamidu</div>
+                        <div>${currentLabels.label_tel} 0786800086</div>
+                    </div>
+                </div>
+            `;
+        } else if (blockId === 'items') {
+            previewHtml += `
+                <div style="border-bottom:1.5px dashed var(--border);margin-bottom:8px;"></div>
+                <div style="display:flex;justify-content:space-between;font-weight:700;font-size:11px;margin-bottom:8px;">
+                    <span style="width:55%;">${currentLabels.label_item}</span>
+                    <span style="width:15%;text-align:center">${currentLabels.label_qty}</span>
+                    <span style="width:30%;text-align:right">${currentLabels.label_amount}</span>
+                </div>
+                <div style="border-bottom:1.5px dashed var(--border);margin-bottom:8px;"></div>
+                <div style="font-size:11px;margin-bottom:10px;">
+                    <div style="display:flex;justify-content:space-between;margin-bottom:4px">
+                        <span style="width:55%;">Sample Router</span><span style="width:15%;text-align:center">1</span><span style="width:30%;text-align:right">15000.00</span>
+                    </div>
+                </div>
+                <div style="border-bottom:1.5px dashed var(--border);margin-bottom:8px;"></div>
+            `;
+        } else if (blockId === 'totals') {
+            previewHtml += `
+                <div style="font-size:12px;margin-bottom:10px;">
+                    <div style="display:flex;justify-content:space-between;margin-bottom:4px;"><span>${currentLabels.label_subtotal}</span><span>15000.00</span></div>
+                    <div style="border-bottom:1.5px dashed var(--border);margin:6px 0;"></div>
+                    <div style="display:flex;justify-content:space-between;font-weight:800;font-size:16px;margin:6px 0;"><span>${currentLabels.label_total}</span><span>15000.00</span></div>
+                    <div style="border-bottom:1.5px dashed var(--border);margin:6px 0;"></div>
+                    <div style="display:flex;justify-content:space-between;margin-top:8px;margin-bottom:4px;"><span>${currentLabels.label_paid}</span><span>15000.00</span></div>
+                    <div style="display:flex;justify-content:space-between;font-weight:700;font-size:14px;"><span>${currentLabels.label_balance}</span><span>0.00</span></div>
+                </div>
+                <div style="border-bottom:1.5px dashed var(--border);margin:10px 0;"></div>
+            `;
+        } else if (blockId === 'footer') {
+            previewHtml += `
+                <div style="text-align:center;font-size:10px;margin-top:12px;">
+                    <p style="font-weight:700;font-size:14px;margin:0 0 4px 0;">${currentLabels.footer_msg1}</p>
+                    <p style="margin:0 0 8px 0;line-height:1.3;">${currentLabels.footer_msg2}</p>
+                </div>
+            `;
+        }
+    });
+
+    previewHtml += `<div style="text-align:center;font-size:10px;margin-top:12px;border-top:1.5px dashed var(--border);padding-top:10px"><p style="margin:0;font-size:12px;font-family:monospace;color:var(--text-muted);">Powered by SmartZone</p></div>`;
+    document.getElementById('tpl-preview').innerHTML = `<div style="width:100%;max-width:80mm;margin:0 auto;font-family:sans-serif;color:var(--text-main)">${previewHtml}</div>`;
+}
+
+function setupDesigner() {
+    document.getElementById('template-select').addEventListener('change', (e) => {
+        const t = invoiceTemplates.find(x => x._id === e.target.value);
+        if (t) {
+            document.getElementById('tpl-id').value = t._id;
+            document.getElementById('tpl-name').value = t.name;
+            currentOrder = Array.isArray(t.order) && t.order.length ? [...t.order] : [...DEFAULT_ORDER];
+            currentVis = t.visibility ? {...t.visibility} : {...DEFAULT_VIS};
+            currentLabels = t.labels ? {...DEFAULT_LABELS, ...t.labels} : {...DEFAULT_LABELS};
+            renderBuilderBlocks();
+            updateLivePreview();
+        } else {
+            document.getElementById('tpl-id').value = '';
+            document.getElementById('tpl-name').value = '';
+            currentOrder = [...DEFAULT_ORDER];
+            currentVis = {...DEFAULT_VIS};
+            currentLabels = {...DEFAULT_LABELS};
+            renderBuilderBlocks();
+            updateLivePreview();
+        }
+    });
+
+    document.getElementById('btn-new-template').onclick = () => {
+        document.getElementById('template-select').value = '';
+        document.getElementById('tpl-id').value = '';
+        document.getElementById('tpl-name').value = '';
+        currentOrder = [...DEFAULT_ORDER];
+        currentVis = {...DEFAULT_VIS};
+        currentLabels = {...DEFAULT_LABELS};
+        renderBuilderBlocks();
+        updateLivePreview();
+    };
+
+    document.getElementById('btn-save-template').onclick = async () => {
+        const id = document.getElementById('tpl-id').value;
+        const name = document.getElementById('tpl-name').value.trim();
+        if (!name) return toast('Template name required', 'error');
+        
+        let newTemplates = [...invoiceTemplates];
+        if (id) {
+            const idx = newTemplates.findIndex(t => t._id === id);
+            if (idx > -1) {
+                newTemplates[idx].name = name;
+                newTemplates[idx].order = [...currentOrder];
+                newTemplates[idx].visibility = {...currentVis};
+                newTemplates[idx].labels = {...currentLabels};
+            }
+        } else {
+            newTemplates.push({ 
+                name, 
+                order: [...currentOrder], 
+                visibility: {...currentVis}, 
+                labels: {...currentLabels},
+                is_active: newTemplates.length === 0 
+            });
+        }
+        
+        try {
+            const res = await api('/auth/profile', { method: 'PUT', body: JSON.stringify({ invoice_templates: newTemplates }) });
+            if (!res.ok) throw new Error('Save failed');
+            toast('Template saved');
+            await loadInvoiceDesigner();
+        } catch(e) { toast(e.message, 'error'); }
+    };
+
+    document.getElementById('btn-delete-template').onclick = async () => {
+        const id = document.getElementById('tpl-id').value;
+        if (!id) return toast('Select a template first', 'error');
+        if (!confirm('Delete this template?')) return;
+        
+        let newTemplates = invoiceTemplates.filter(t => t._id !== id);
+        try {
+            const res = await api('/auth/profile', { method: 'PUT', body: JSON.stringify({ invoice_templates: newTemplates }) });
+            if (!res.ok) throw new Error('Delete failed');
+            toast('Template deleted');
+            await loadInvoiceDesigner();
+        } catch(e) { toast(e.message, 'error'); }
+    };
+
+    document.getElementById('btn-activate-template').onclick = async () => {
+        const id = document.getElementById('tpl-id').value;
+        if (!id) return toast('Select a template first', 'error');
+        
+        let newTemplates = invoiceTemplates.map(t => ({ ...t, is_active: t._id === id }));
+        try {
+            const res = await api('/auth/profile', { method: 'PUT', body: JSON.stringify({ invoice_templates: newTemplates }) });
+            if (!res.ok) throw new Error('Activation failed');
+            toast('Template activated');
+            await loadInvoiceDesigner();
+        } catch(e) { toast(e.message, 'error'); }
+    };
+}
+
+async function loadInvoiceDesigner() {
+    try {
+        const res = await api('/auth/profile');
+        if (!res) return;
+        const p = await res.json();
+        invoiceTemplates = p.invoice_templates || [];
+        
+        const sel = document.getElementById('template-select');
+        sel.innerHTML = '<option value="">-- Select Template --</option>' + 
+            invoiceTemplates.map(t => `<option value="${t._id}">${t.name} ${t.is_active ? '(Active)' : ''}</option>`).join('');
+            
+        const active = invoiceTemplates.find(t => t.is_active);
+        if (active && !document.getElementById('tpl-id').value) {
+            sel.value = active._id;
+            sel.dispatchEvent(new Event('change'));
+        } else {
+            renderBuilderBlocks();
+            updateLivePreview();
+        }
+    } catch(e) { console.error(e); }
+}
+
+// === BARCODE PRINTER ===
+let printQueue = [];
+
+async function loadBarcodePrinter() {
+    const search = document.getElementById('barcode-search')?.value.toLowerCase() || '';
+    try {
+        const res = await api('/products?lite=true');
+        if (!res) return;
+        const allProducts = await res.json();
+        const filtered = allProducts.filter(p => {
+            if (p.is_imei_tracked) return false;
+            const nameMatch = (p.name || '').toLowerCase().includes(search);
+            const barcodeMatch = (p.barcode || '').toLowerCase().includes(search);
+            return nameMatch || barcodeMatch;
+        });
+
+        const tb = document.querySelector('#barcode-print-table tbody');
+        if (tb) {
+            if (filtered.length === 0) {
+                tb.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:20px;color:var(--text-muted)">No products found</td></tr>';
+                return;
+            }
+            tb.innerHTML = filtered.map(p => `
+                <tr style="cursor:pointer">
+                    <td><strong>${p.name}</strong></td>
+                    <td><code style="background:var(--bg-soft);padding:2px 6px;border-radius:4px;font-size:12px">${p.barcode || '<span style="color:var(--danger)">No Barcode</span>'}</code></td>
+                    <td><input type="number" class="form-control" data-bc-id="${p.id}" value="${document.getElementById('barcode-copies').value || 10}" min="1" style="width:60px;padding:4px;font-size:12px" onclick="event.stopPropagation()"></td>
+                    <td style="text-align:right">
+                        <button class="btn btn-sm btn-outline" onclick="addToPrintQueue('${p.name.replace(/'/g, "\\'")}', '${p.barcode||''}', ${p.price}, this.closest('tr').querySelector('[data-bc-id]').value)">
+                            <i class='bx bx-plus'></i> Add
+                        </button>
+                    </td>
+                </tr>`).join('');
+        }
+    } catch(e) { console.error(e); }
+}
+
+window.addToPrintQueue = function(name, barcode, price, customQty) {
+    if (!barcode || !barcode.trim()) return toast('This product has no barcode. Please edit it first.', 'error');
+    barcode = barcode.trim();
+    const existing = printQueue.find(item => item.barcode === barcode);
+    const qty = parseInt(customQty) || parseInt(document.getElementById('barcode-copies').value) || 10;
+    if (existing) {
+        existing.qty += qty;
+    } else {
+        printQueue.push({ name, barcode, price, qty });
+    }
+    toast(`Added ${name} (${qty} copies) to queue`);
+    renderPrintQueue();
+};
+
+window.removeFromPrintQueue = function(index) {
+    printQueue.splice(index, 1);
+    renderPrintQueue();
+};
+
+function renderPrintQueue() {
+    const tb = document.querySelector('#barcode-queue-table tbody');
+    if (!tb) return;
+    if (printQueue.length === 0) {
+        tb.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:20px;color:var(--text-muted)">Queue is empty</td></tr>';
+        return;
+    }
+    tb.innerHTML = printQueue.map((item, index) => `
+        <tr>
+            <td><strong>${item.name}</strong></td>
+            <td><code>${item.barcode}</code></td>
+            <td><input type="number" class="form-control" style="width:60px;padding:4px" value="${item.qty}" onchange="printQueue[${index}].qty = parseInt(this.value)||1"></td>
+            <td style="text-align:right">
+                <button class="btn btn-sm btn-ghost" style="color:var(--danger)" onclick="removeFromPrintQueue(${index})"><i class='bx bx-trash'></i></button>
+            </td>
+        </tr>
+    `).join('');
+}
+
+function setupBarcodePrinter() {
+    const searchInput = document.getElementById('barcode-search');
+    if (searchInput) {
+        searchInput.onkeyup = loadBarcodePrinter;
+    }
+    const printAllBtn = document.getElementById('btn-print-all');
+    if (printAllBtn) {
+        printAllBtn.onclick = () => {
+            if (printQueue.length === 0) return toast('Queue is empty', 'error');
+            printBarcodeA4();
+        };
+    }
+}
+
+window.printBarcodeA4 = function() {
+    if (printQueue.length === 0) return;
+    
+    const size = document.getElementById('barcode-size').value;
+    let perRow = 4, labelHeight = 35;
+    if (size === 'small') { perRow = 5; labelHeight = 25; }
+    else if (size === 'medium') { perRow = 4; labelHeight = 35; }
+    else if (size === 'large') { perRow = 2; labelHeight = 50; }
+
+    const printWindow = window.open('', '_blank', 'width=900,height=700');
+    
+    let labelsHtml = '';
+    printQueue.forEach((item, itemIdx) => {
+        for (let i = 0; i < item.qty; i++) {
+            labelsHtml += `
+                <div class="label">
+                    <div class="name">${item.name}</div>
+                    <svg id="barcode-${itemIdx}-${i}" class="barcode-svg"></svg>
+                    <div class="price">Rs. ${item.price.toFixed(2)}</div>
+                </div>
+            `;
+        }
+    });
+
+    printWindow.document.write(`
+        <html>
+        <head>
+            <title>Barcode Print Queue</title>
+            <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700;800&display=swap" rel="stylesheet">
+            <style>
+                @page { size: A4; margin: 5mm; }
+                body { font-family: 'Inter', sans-serif; margin: 0; padding: 0; background: #fff; color: #000; }
+                .grid { 
+                    display: grid; 
+                    grid-template-columns: repeat(${perRow}, 1fr); 
+                    gap: 5mm 3mm; 
+                    padding: 5mm;
+                }
+                .label {
+                    border: 0.1px solid #eee;
+                    padding: 5px;
+                    text-align: center;
+                    display: flex;
+                    flex-direction: column;
+                    align-items: center;
+                    justify-content: space-between;
+                    height: ${labelHeight}mm;
+                    page-break-inside: avoid;
+                    border-radius: 2px;
+                }
+                .name { font-size: 8px; font-weight: 700; margin-bottom: 1px; width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+                .price { font-size: 9px; font-weight: 800; margin-top: 1px; }
+                .barcode-svg { width: 100%; height: auto; max-height: ${labelHeight - 12}mm; }
+            </style>
+            <script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.5/dist/JsBarcode.all.min.js"></script>
+        </head>
+        <body>
+            <div class="grid">${labelsHtml}</div>
+            <script>
+                window.onload = function() {
+                    const queue = ${JSON.stringify(printQueue)};
+                    const size = "${size}";
+                    let bcWidth = 2, bcHeight = 40, bcFontSize = 12;
+                    if (size === 'small') { bcWidth = 1.2; bcHeight = 30; bcFontSize = 10; }
+                    else if (size === 'medium') { bcWidth = 1.8; bcHeight = 45; bcFontSize = 14; }
+                    else if (size === 'large') { bcWidth = 2.5; bcHeight = 60; bcFontSize = 18; }
+
+                    queue.forEach((item, itemIdx) => {
+                        for (let i = 0; i < item.qty; i++) {
+                            JsBarcode("#barcode-" + itemIdx + "-" + i, item.barcode, {
+                                format: "CODE128",
+                                width: bcWidth,
+                                height: bcHeight,
+                                displayValue: true,
+                                fontSize: bcFontSize,
+                                margin: 0,
+                                textMargin: 2
+                            });
+                        }
+                    });
+                    setTimeout(() => {
+                        window.print();
+                        window.close();
+                    }, 500);
+                };
+            </script>
+        </body>
+        </html>
+    `);
+    printWindow.document.close();
+};
+
+// === INIT ===
+function setupAll() {
+    initTheme(); checkAuth(); updateClock(); setInterval(updateClock, 1000);
+    setupNav(); setupProductModal(); setupImeiModal(); setupCustomerModal(); setupSupplierModal(); setupDesigner();
+    setupPOS(); setupWarranty(); setupSLT(); setupStatusModal(); setupInvoiceFilters(); setupReportTabs();
+    setupBarcodePrinter(); setupVoucherModal(); setupCustomerSearch();
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    setupAll();
+    // Scan mode toggle
+    document.getElementById('btn-scan-mode').onclick = toggleScanMode;
+    // Admin edit save button
+    document.getElementById('btn-save-admin-edit').onclick = saveAdminEdit;
+
+    // Check for pending registrations (admin notification)
+    checkPendingRegistrations();
+    setInterval(checkPendingRegistrations, 30000); // Check every 30s
+    // Clear bill button
+    document.getElementById('btn-clear-bill').onclick = () => {
+        if (currentBill.length && !confirm('Clear the current bill?')) return;
+        currentBill = []; imeiInBill = []; hasImeiInBill = false;
+        voucherDiscount = 0; voucherCode = '';
+        document.getElementById('pos-customer-box').style.display = 'none';
+        const custBtn = document.getElementById('btn-toggle-customer');
+        if (custBtn) { custBtn.classList.remove('btn-primary'); custBtn.classList.add('btn-outline'); }
+        document.getElementById('voucher-discount-row').style.display = 'none';
+        document.getElementById('pos-voucher').value = '';
+        document.getElementById('pos-cust-name').value = '';
+        document.getElementById('pos-cust-phone').value = '';
+        document.getElementById('pos-cust-nic').value = '';
+        document.getElementById('pos-cust-email').value = '';
+        document.getElementById('pos-cust-address').value = '';
+        document.getElementById('pos-cust-select').value = '';
+        renderBill();
+    };
+});
+
+// === VOUCHERS ===
+let vouchersList = [];
+async function loadVouchers() {
+    try {
+        const res = await api(`/vouchers?_t=${Date.now()}`);
+        if (!res) return;
+        vouchersList = await res.json();
+        const tb = document.querySelector('#vouchers-table tbody');
+        if (tb) {
+            tb.innerHTML = vouchersList.map(v => `<tr>
+                <td><strong>${v.code}</strong></td>
+                <td>${v.discount_type === 'percentage' ? 'Percentage' : 'Fixed'}</td>
+                <td>${v.discount_type === 'percentage' ? v.discount_value + '%' : 'Rs. ' + v.discount_value}</td>
+                <td>${v.used_count} / ${v.usage_limit || '∞'}</td>
+                <td>${v.expiry_date ? formatDate(v.expiry_date) : 'No expiry'}</td>
+                <td><span class="badge badge-${v.status === 'active' ? 'green' : 'gray'}">${v.status}</span></td>
+                <td>
+                    <button class="btn btn-sm btn-outline" onclick="editVoucher('${v.id}')"><i class='bx bx-edit'></i></button>
+                    <button class="btn btn-sm btn-danger" onclick="deleteVoucher('${v.id}')"><i class='bx bx-trash'></i></button>
+                </td>
+            </tr>`).join('');
+        }
+    } catch (e) { console.error(e); }
+}
+
+function setupVoucherModal() {
+    const btnAdd = document.getElementById('btn-add-voucher');
+    if (btnAdd) {
+        btnAdd.onclick = () => {
+            document.getElementById('voucher-form').reset();
+            document.getElementById('vouch-id').value = '';
+            document.getElementById('voucher-modal-title').textContent = 'Create Voucher';
+            openModal('modal-voucher');
+        };
+    }
+
+    const btnSave = document.getElementById('btn-save-voucher');
+    if (btnSave) {
+        btnSave.onclick = async () => {
+            const id = document.getElementById('vouch-id').value;
+            const data = {
+                code: document.getElementById('vouch-code').value.trim(),
+                discount_type: document.getElementById('vouch-type').value,
+                discount_value: parseFloat(document.getElementById('vouch-value').value),
+                usage_limit: parseInt(document.getElementById('vouch-limit').value) || null,
+                expiry_date: document.getElementById('vouch-expiry').value,
+                status: document.getElementById('vouch-status').value
+            };
+
+            if (!data.code || isNaN(data.discount_value)) {
+                return toast('Code and Value are required', 'error');
+            }
+
+            try {
+                const res = await api(id ? `/vouchers/${id}` : '/vouchers', {
+                    method: id ? 'PUT' : 'POST',
+                    body: JSON.stringify(data)
+                });
+                if (!res) return;
+                const d = await res.json();
+                if (!res.ok) throw new Error(d.error);
+                toast(id ? 'Voucher updated' : 'Voucher created');
+                closeModal('modal-voucher');
+                loadVouchers();
+            } catch (e) { toast(e.message, 'error'); }
+        };
+    }
+}
+
+window.editVoucher = function(id) {
+    const v = vouchersList.find(x => x.id === id);
+    if (!v) return;
+    document.getElementById('vouch-id').value = v.id;
+    document.getElementById('vouch-code').value = v.code;
+    document.getElementById('vouch-type').value = v.discount_type;
+    document.getElementById('vouch-value').value = v.discount_value;
+    document.getElementById('vouch-limit').value = v.usage_limit || '';
+    document.getElementById('vouch-expiry').value = v.expiry_date ? v.expiry_date.split('T')[0] : '';
+    document.getElementById('vouch-status').value = v.status;
+    document.getElementById('voucher-modal-title').textContent = 'Edit Voucher';
+    openModal('modal-voucher');
+};
+
+window.deleteVoucher = async function(id) {
+    if (!confirm('Delete this voucher?')) return;
+    try {
+        const res = await api(`/vouchers/${id}`, { method: 'DELETE' });
+        if (!res) return;
+        if (!res.ok) throw new Error('Failed to delete');
+        toast('Voucher deleted');
+        loadVouchers();
+    } catch (e) { toast(e.message, 'error'); }
+};
+
+// === SUPPLIER PAYMENTS ===
+let supplierPaymentsList = [];
+async function loadSupplierPayments() {
+    try {
+        const statusFilter = document.getElementById('sup-payment-filter')?.value || '';
+        const supplierFilter = document.getElementById('sup-payment-supplier-filter')?.value || '';
+        let url = '/suppliers/payments?';
+        if (statusFilter) url += `status=${statusFilter}&`;
+        if (supplierFilter) url += `supplier=${encodeURIComponent(supplierFilter)}&`;
+        url += `_t=${Date.now()}`;
+        const res = await api(url);
+        if (!res) return;
+        supplierPaymentsList = await res.json();
+        const payments = supplierPaymentsList;
+
+        // Summary
+        const totalOwed = payments.filter(p => !p.is_paid).reduce((s, p) => s + (p.total_amount - (p.paid_amount || 0)), 0);
+        const totalPaid = payments.reduce((s, p) => s + (p.paid_amount || 0), 0);
+        const unpaidCount = payments.filter(p => !p.is_paid).length;
+        const summaryEl = document.getElementById('sup-payment-summary');
+        if (summaryEl) {
+            summaryEl.innerHTML = `
+                <div><strong style="color:var(--danger)">Remaining Balance:</strong> Rs. ${totalOwed.toLocaleString()} (${unpaidCount} items)</div>
+                <div><strong style="color:var(--success)">Total Paid:</strong> Rs. ${totalPaid.toLocaleString()}</div>
+            `;
+        }
+
+        const tb = document.querySelector('#sup-payments-table tbody');
+        if (!tb) return;
+        if (payments.length === 0) {
+            tb.innerHTML = '<tr><td colspan="9" style="text-align:center;padding:30px;color:var(--text-muted)"><i class="bx bx-receipt" style="font-size:24px;display:block;margin-bottom:8px"></i>No supplier payments found</td></tr>';
+            return;
+        }
+        tb.innerHTML = payments.map(p => {
+            const paid = p.paid_amount || 0;
+            const remaining = p.total_amount - paid;
+            const supplierOwes = remaining < 0; // supplier owes us money
+            return `<tr class="${supplierOwes ? 'supplier-owes-row' : (!p.is_paid ? '' : '')}" style="${(!supplierOwes && !p.is_paid) ? 'background:var(--danger-light)' : ''}">
+            <td><strong>${p.supplier_name}</strong></td>
+            <td>${p.product_name}</td>
+            <td>${p.quantity}</td>
+            <td>Rs. ${p.cost_price.toLocaleString()}</td>
+            <td>
+                <div>Total: Rs. ${p.total_amount.toLocaleString()}</div>
+                <div style="font-size:11px;color:var(--success)">Paid: Rs. ${paid.toLocaleString()}</div>
+                ${remaining > 0 ? 
+                    `<strong style="color:var(--danger)">Rem: Rs. ${remaining.toLocaleString()}</strong>` : 
+                 remaining < 0 ? 
+                    `<strong style="color:var(--danger)">⚠ Supplier Owes: Rs. ${Math.abs(remaining).toLocaleString()}</strong>` :
+                    `<strong style="color:var(--success)">Cleared</strong>`}
+            </td>
+            <td>${p.sale_date || '-'}</td>
+            <td><code style="font-size:11px">${p.invoice_number || '-'}</code></td>
+            <td>${p.is_paid ?
+                `<span class="badge badge-green">Paid</span><br><small style="color:var(--text-muted)">${p.paid_date}</small>` :
+                '<span class="badge badge-red">Unpaid</span>'}</td>
+            <td>
+                ${!p.is_paid ?
+                `<button class="btn btn-sm btn-success" style="margin-bottom:4px;width:100%" onclick="openSupplierPayModal('${p.id}')"><i class='bx bx-money'></i> Pay</button>` :
+                '<span style="color:var(--text-muted);font-size:12px;display:block;margin-bottom:4px">✓ Settled</span>'}
+                <button class="btn btn-sm btn-outline" style="padding:2px 6px" onclick="printSupplierReceiptById('${p.id}')" title="Print Receipt"><i class='bx bx-printer'></i></button>
+                <button class="btn btn-sm btn-outline" style="padding:2px 6px" onclick="editSupplierRecord('${p.id}')"><i class='bx bx-edit'></i></button>
+                <button class="btn btn-sm btn-danger" style="padding:2px 6px" onclick="deleteSupplierRecord('${p.id}')"><i class='bx bx-trash'></i></button>
+            </td>
+        </tr>`}).join('');
+    } catch(e) { console.error(e); }
+}
+
+window.openSupplierPayModal = function(id) {
+    const p = supplierPaymentsList.find(x => x.id === id);
+    if (!p) return;
+    const paid = p.paid_amount || 0;
+    const rem = p.total_amount - paid;
+    
+    document.getElementById('sup-pay-id').value = id;
+    document.getElementById('sup-pay-total').value = 'Rs. ' + parseFloat(p.total_amount).toLocaleString();
+    document.getElementById('sup-pay-rem').value = 'Rs. ' + parseFloat(rem).toLocaleString();
+    document.getElementById('sup-pay-amount').value = rem;
+    document.getElementById('sup-pay-notes').value = '';
+    
+    const imeiSec = document.getElementById('sup-pay-imei-section');
+    const imeiList = document.getElementById('sup-pay-imei-list');
+    if (p.is_imei_product && p.imei_numbers && p.imei_numbers.length > 0) {
+        imeiSec.style.display = 'block';
+        const unpaidImeis = p.imei_numbers.filter(i => !(p.paid_imeis || []).includes(i));
+        if (unpaidImeis.length === 0) {
+            imeiList.innerHTML = '<span style="font-size:12px;color:var(--success)">All IMEIs paid.</span>';
+        } else {
+            imeiList.innerHTML = unpaidImeis.map(imei => `
+                <label style="display:flex;align-items:center;gap:6px;font-size:12px;background:var(--bg-card);padding:4px 8px;border:1px solid var(--border);border-radius:4px;cursor:pointer">
+                    <input type="checkbox" class="sup-pay-imei-cb" value="${imei}" data-cost="${p.cost_price}">
+                    ${imei} (Rs. ${p.cost_price.toLocaleString()})
+                </label>
+            `).join('');
+            
+            // Auto-update amount when checkboxes change
+            document.querySelectorAll('.sup-pay-imei-cb').forEach(cb => {
+                cb.addEventListener('change', () => {
+                    const checked = document.querySelectorAll('.sup-pay-imei-cb:checked');
+                    if (checked.length > 0) {
+                        let total = 0;
+                        checked.forEach(c => total += parseFloat(c.dataset.cost));
+                        document.getElementById('sup-pay-amount').value = total;
+                    } else {
+                        document.getElementById('sup-pay-amount').value = rem;
+                    }
+                });
+            });
+        }
+    } else {
+        imeiSec.style.display = 'none';
+        imeiList.innerHTML = '';
+    }
+    
+    openModal('modal-supplier-pay');
+};
+
+document.getElementById('btn-submit-sup-pay')?.addEventListener('click', async () => {
+    const id = document.getElementById('sup-pay-id').value;
+    const amount = parseFloat(document.getElementById('sup-pay-amount').value);
+    const notes = document.getElementById('sup-pay-notes').value.trim();
+    
+    // Gather checked IMEIs if any
+    const paid_imeis = Array.from(document.querySelectorAll('.sup-pay-imei-cb:checked')).map(cb => cb.value);
+    
+    if (isNaN(amount) || amount <= 0) return toast('Please enter a valid amount', 'error');
+    
+    try {
+        const res = await api(`/suppliers/payments/${id}/pay`, { 
+            method: 'PUT', 
+            body: JSON.stringify({ amount, notes, paid_imeis }) 
+        });
+        if (!res) return;
+        if (!res.ok) throw new Error('Failed to submit payment');
+        const paymentRes = await res.json();
+        
+        toast('Payment submitted successfully');
+        closeModal('modal-supplier-pay');
+        await loadSupplierPayments();
+        
+        // Find the updated payment object for printing
+        const p = supplierPaymentsList.find(x => x.id === id);
+        if (p) printSupplierReceipt(paymentRes.payment || p, amount, paid_imeis);
+    } catch(e) { toast(e.message, 'error'); }
+});
+
+window.printSupplierReceiptById = function(id) {
+    const p = supplierPaymentsList.find(x => x.id === id);
+    if (p) printSupplierReceipt(p, 0, []);
+};
+
+window.printSupplierReceipt = function(p, paidNow = 0, paidImeisNow = []) {
+    const pa = document.getElementById('print-area');
+    if (!pa) return;
+    
+    const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Colombo', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+    const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    
+    let imeiHtml = '';
+    if (paidImeisNow && paidImeisNow.length > 0) {
+        paidImeisNow.forEach(imei => {
+            imeiHtml += `<div style="font-size:10px;color:#333;margin-top:2px;font-family:monospace">IMEI: ${imei}</div>`;
+        });
+    } else if (p.is_imei_product && p.paid_imeis && p.paid_imeis.length > 0) {
+        p.paid_imeis.forEach(imei => {
+            imeiHtml += `<div style="font-size:10px;color:#333;margin-top:2px;font-family:monospace">IMEI: ${imei}</div>`;
+        });
+    }
+
+    let displayQty = paidImeisNow && paidImeisNow.length > 0 ? paidImeisNow.length : p.quantity;
+    let displayAmt = paidImeisNow && paidImeisNow.length > 0 ? paidNow : p.total_amount;
+
+    pa.innerHTML = `
+        <div style="width:100%;max-width:80mm;font-family:sans-serif;color:#000;">
+            <div style="text-align:center;margin-bottom:12px;">
+                <h1 style="margin:0;font-size:18px;font-weight:800;text-transform:uppercase;">PAYMENT VOUCHER</h1>
+                <p style="margin:2px 0;font-size:11px;font-weight:500;">SmartZone</p>
+                <div style="border-bottom:1.5px dashed #000;margin:8px 0;"></div>
+            </div>
+            
+            <div style="font-size:11px;font-weight:500;margin-bottom:10px;">
+                <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+                    <span>Date: ${today}</span>
+                    <span>Time: ${time}</span>
+                </div>
+                <div style="margin-top:6px;"><div style="font-weight:700;">Supplier: ${p.supplier_name}</div></div>
+                ${p.invoice_number ? `<div style="margin-top:2px;">Invoice: ${p.invoice_number}</div>` : ''}
+            </div>
+            
+            <div style="border-bottom:1.5px dashed #000;margin-bottom:8px;"></div>
+            <div style="display:flex;justify-content:space-between;font-weight:700;font-size:11px;margin-bottom:8px;">
+                <span style="width:55%;text-align:left">Item</span>
+                <span style="width:15%;text-align:center">Qty</span>
+                <span style="width:30%;text-align:right">Amount</span>
+            </div>
+            <div style="border-bottom:1.5px dashed #000;margin-bottom:8px;"></div>
+            
+            <div style="font-size:11px;margin-bottom:10px;">
+                <div style="margin-bottom:6px;">
+                    <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+                        <span style="width:55%;word-break:break-word;padding-right:4px">${p.product_name}</span>
+                        <span style="width:15%;text-align:center">${displayQty}</span>
+                        <span style="width:30%;text-align:right">${displayAmt.toLocaleString(undefined, {minimumFractionDigits:2})}</span>
+                    </div>
+                    ${imeiHtml}
+                </div>
+            </div>
+            <div style="border-bottom:1.5px dashed #000;margin-bottom:8px;"></div>
+            
+            <div style="font-size:12px;margin-bottom:10px;">
+                <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+                    <span>Total Bill:</span>
+                    <span>Rs. ${p.total_amount.toLocaleString(undefined, {minimumFractionDigits:2})}</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;margin-bottom:4px;font-weight:bold;">
+                    <span>Total Paid So Far:</span>
+                    <span>Rs. ${(p.paid_amount || 0).toLocaleString(undefined, {minimumFractionDigits:2})}</span>
+                </div>
+                ${paidNow > 0 ? `
+                <div style="display:flex;justify-content:space-between;margin-bottom:4px;color:#000;">
+                    <span>Paid in this transaction:</span>
+                    <span>Rs. ${paidNow.toLocaleString(undefined, {minimumFractionDigits:2})}</span>
+                </div>` : ''}
+                <div style="border-bottom:1.5px dashed #000;margin:6px 0;"></div>
+                <div style="display:flex;justify-content:space-between;font-weight:700;font-size:14px;">
+                    <span>Remaining Bal:</span>
+                    <span>Rs. ${Math.max(0, p.total_amount - (p.paid_amount || 0)).toLocaleString(undefined, {minimumFractionDigits:2})}</span>
+                </div>
+            </div>
+            <div style="border-bottom:1.5px dashed #000;margin:10px 0;"></div>
+            
+            <div style="text-align:center;font-size:10px;margin-top:12px;">
+                <p style="margin:0 0 8px 0;">Supplier Payment Record</p>
+                <div style="border-top:1.5px dashed #000;padding-top:10px;margin-top:8px">
+                    <p style="margin:0;font-size:12px;font-family:monospace;color:#555;">Powered by SmartZone</p>
+                </div>
+            </div>
+        </div>
+    `;
+    
+    pa.style.display = 'block';
+    
+    setTimeout(() => { 
+        window.print(); 
+        pa.style.display = 'none'; 
+    }, 300);
+};
+
+document.getElementById('btn-add-sup-payment')?.addEventListener('click', () => {
+    document.getElementById('supplier-record-form').reset();
+    document.getElementById('sup-rec-id').value = '';
+    document.getElementById('sup-record-title').innerHTML = "<i class='bx bx-list-plus' style='color:var(--primary)'></i> Add Supplier Record";
+    
+    // Populate datalist with unique supplier names
+    const names = [...new Set(suppliers.map(s => s.name))];
+    const dl = document.getElementById('sup-rec-supplier-list');
+    if (dl) dl.innerHTML = names.map(n => `<option value="${n}">`).join('');
+    
+    openModal('modal-supplier-record');
+});
+
+window.editSupplierRecord = function(id) {
+    const p = supplierPaymentsList.find(x => x.id === id);
+    if (!p) return;
+    document.getElementById('sup-rec-id').value = id;
+    document.getElementById('sup-rec-supplier').value = p.supplier_name || '';
+    document.getElementById('sup-rec-product').value = p.product_name || '';
+    document.getElementById('sup-rec-qty').value = p.quantity || 1;
+    document.getElementById('sup-rec-cost').value = p.cost_price || 0;
+    document.getElementById('sup-rec-total').value = p.total_amount || 0;
+    document.getElementById('sup-rec-paid').value = p.paid_amount || 0;
+    document.getElementById('sup-rec-notes').value = p.notes || '';
+    
+    const names = [...new Set(suppliers.map(s => s.name))];
+    const dl = document.getElementById('sup-rec-supplier-list');
+    if (dl) dl.innerHTML = names.map(n => `<option value="${n}">`).join('');
+    
+    document.getElementById('sup-record-title').innerHTML = "<i class='bx bx-edit' style='color:var(--primary)'></i> Edit Supplier Record";
+    openModal('modal-supplier-record');
+};
+
+window.deleteSupplierRecord = async function(id) {
+    if (!confirm('Are you sure you want to delete this payment record? This action cannot be undone.')) return;
+    try {
+        const res = await api(`/suppliers/payments/${id}`, { method: 'DELETE' });
+        if (!res) return;
+        if (!res.ok) throw new Error('Failed to delete payment record');
+        toast('Record deleted successfully');
+        loadSupplierPayments();
+    } catch (e) { toast(e.message, 'error'); }
+};
+
+document.getElementById('btn-save-sup-record')?.addEventListener('click', async () => {
+    const id = document.getElementById('sup-rec-id').value;
+    const payload = {
+        supplier_name: document.getElementById('sup-rec-supplier').value.trim(),
+        product_name: document.getElementById('sup-rec-product').value.trim(),
+        quantity: parseInt(document.getElementById('sup-rec-qty').value) || 1,
+        cost_price: parseFloat(document.getElementById('sup-rec-cost').value) || 0,
+        total_amount: parseFloat(document.getElementById('sup-rec-total').value) || 0,
+        paid_amount: parseFloat(document.getElementById('sup-rec-paid').value) || 0,
+        notes: document.getElementById('sup-rec-notes').value.trim()
+    };
+    
+    if (!payload.supplier_name) return toast('Supplier Name is required', 'error');
+    if (isNaN(payload.total_amount)) return toast('Total Amount is required', 'error');
+    
+    try {
+        const res = await api(id ? `/suppliers/payments/${id}` : '/suppliers/payments', {
+            method: id ? 'PUT' : 'POST',
+            body: JSON.stringify(payload)
+        });
+        if (!res) return;
+        if (!res.ok) throw new Error('Failed to save record');
+        toast(id ? 'Record updated' : 'Record added successfully');
+        closeModal('modal-supplier-record');
+        loadSupplierPayments();
+    } catch(e) { toast(e.message, 'error'); }
+});
+
+// === ADMIN PENDING REGISTRATION NOTIFICATION ===
+function playAdminNotificationSound() {
+    try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.frequency.value = 880;
+        osc.type = 'sine';
+        gain.gain.setValueAtTime(0.3, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.5);
+        osc.start(ctx.currentTime);
+        osc.stop(ctx.currentTime + 0.5);
+        setTimeout(() => ctx.close(), 1000);
+    } catch(e) { /* silent */ }
+}
+
+async function checkPendingRegistrations() {
+    if (role !== 'admin') return;
+    try {
+        const res = await api('/admin/pending-count');
+        if (!res || !res.ok) return;
+        const data = await res.json();
+        const dot = document.getElementById('admin-notify-dot');
+        if (dot) {
+            if (data.count > 0) {
+                dot.style.display = 'inline-block';
+                dot.title = `${data.count} pending registration(s)`;
+                if (data.count > previousPendingCount) {
+                    playAdminNotificationSound();
+                }
+            } else {
+                dot.style.display = 'none';
+            }
+        }
+        previousPendingCount = data.count;
+    } catch(e) { /* silent */ }
+}
+
+// === CUSTOMER SEARCH IN POS ===
+function setupCustomerSearch() {
+    const searchInput = document.getElementById('pos-cust-search');
+    if (!searchInput) return;
+
+    searchInput.addEventListener('input', function() {
+        const q = this.value.toLowerCase().trim();
+        const resultsDiv = document.getElementById('pos-cust-search-results');
+        if (!q || q.length < 2) { resultsDiv.style.display = 'none'; return; }
+
+        const filtered = customers.filter(c =>
+            c.name.toLowerCase().includes(q) ||
+            c.phone.includes(q) ||
+            (c.nic_number && c.nic_number.toLowerCase().includes(q))
+        ).slice(0, 8);
+
+        if (filtered.length === 0) {
+            resultsDiv.innerHTML = '<div style="padding:12px;text-align:center;color:var(--text-muted);font-size:13px">No customers found</div>';
+        } else {
+            resultsDiv.innerHTML = filtered.map(c => `
+                <div class="cust-search-item" onclick="selectCustomerFromSearch('${c.id}')">
+                    <div style="font-weight:600">${c.name}</div>
+                    <div style="font-size:11px;color:var(--text-muted)">${c.phone} ${c.nic_number ? '• NIC: ' + c.nic_number : ''}</div>
+                </div>
+            `).join('');
+        }
+        resultsDiv.style.display = 'block';
+    });
+
+    // Close on click outside
+    document.addEventListener('click', function(e) {
+        const resultsDiv = document.getElementById('pos-cust-search-results');
+        if (resultsDiv && !e.target.closest('#pos-cust-search') && !e.target.closest('#pos-cust-search-results')) {
+            resultsDiv.style.display = 'none';
+        }
+    });
+}
+
+window.selectCustomerFromSearch = function(id) {
+    const c = customers.find(x => x.id === id);
+    if (!c) return;
+    document.getElementById('pos-cust-name').value = c.name;
+    document.getElementById('pos-cust-phone').value = c.phone;
+    document.getElementById('pos-cust-nic').value = c.nic_number || '';
+    document.getElementById('pos-cust-email').value = c.email || '';
+    document.getElementById('pos-cust-address').value = c.address || '';
+    document.getElementById('pos-cust-search').value = c.name;
+    document.getElementById('pos-cust-search-results').style.display = 'none';
+    // Also set the hidden select
+    const sel = document.getElementById('pos-cust-select');
+    if (sel) {
+        for (let opt of sel.options) {
+            if (opt.value === id) { sel.value = id; break; }
+        }
+    }
+    toast(`Customer selected: ${c.name}`);
+};
+
+window.saveCustomerFromPOS = async function() {
+    const name = document.getElementById('pos-cust-name').value.trim();
+    const phone = document.getElementById('pos-cust-phone').value.trim();
+    if (!name || !phone) return toast('Name and Phone are required to save', 'error');
+    
+    // Check if already exists
+    const existing = customers.find(c => c.phone === phone);
+    if (existing) return toast('Customer with this phone already exists', 'error');
+    
+    const payload = {
+        name, phone,
+        nic_number: document.getElementById('pos-cust-nic').value.trim(),
+        email: document.getElementById('pos-cust-email').value.trim(),
+        address: document.getElementById('pos-cust-address').value.trim()
+    };
+    
+    try {
+        const res = await api('/customers', { method: 'POST', body: JSON.stringify(payload) });
+        if (res && res.ok) {
+            toast('Customer saved successfully');
+            loadCustomers();
+        } else {
+            toast('Failed to save customer', 'error');
+        }
+    } catch(e) {
+        toast('Error saving customer', 'error');
+    }
+};
